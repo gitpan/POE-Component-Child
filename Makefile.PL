@@ -12,6 +12,6 @@ WriteMakefile(
         ),
     PREREQ_PM => {
         POE             => '0.23',
-        Test::Simple    => 0
+        Test::Simple    => 0,
         },
     );

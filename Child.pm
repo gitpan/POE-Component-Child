@@ -31,7 +31,7 @@ use POE 0.23 qw(Wheel::Run Filter::Line Driver::SysRW);
 # --- module variables --------------------------------------------------------
 
 use vars qw($VERSION $PKG $AUTOLOAD);
-$VERSION = substr q$Revision: 1.31 $, 10;
+$VERSION = substr q$Revision: 1.33 $, 10;
 $PKG = __PACKAGE__;
 
 # --- module interface --------------------------------------------------------
@@ -86,6 +86,7 @@ sub quit {
 
 sub kill {
 	my $self = shift;
+    local %_ = @_;
     my $sig = $_{HARD} ? 9 : $_{SIG} || 'TERM';
     my $nod = $_{NODIE} || 0;
 
@@ -230,8 +231,8 @@ sub sig_child {
     $kernel->sig_handled() if $POE::VERSION >= 0.20;
 
     my %args = (self => $self, id => $id, rc => $rc);
-    return done(%args) if $self->{$PKG}{CloseEvent};
-    $self->{$PKG}{SIGCHLD} = \%args;
+    return done(%args) if $self->{$PKG}{CLOSED}{$id};
+    $self->{$PKG}{SIGCHLD}{$id} = \%args;
 
     my $sid = $_[SESSION]->ID;
 	$self->debug("sig_child(): session=$sid, wheel=$id, pid=$pid, rc=$rc");
@@ -241,11 +242,12 @@ sub sig_child {
 
 sub close {
     my $self = $_[HEAP]->{self};
-    my $sigchld = $self->{$PKG}{SIGCHLD};
+    my $id = $_[ARG0];
+    my $sigchld = $self->{$PKG}{SIGCHLD}{$id};
 
     return done(%$sigchld) if $sigchld;
 
-    $self->{$PKG}{CloseEvent} = 1;
+    $self->{$PKG}{CLOSED}{$id} = 1;
     $self->debug("close()");
     }
 
@@ -499,6 +501,6 @@ Copyright (c) 2002-2003 Erick Calder.
 
 This product is free and distributed under the Gnu Public License (GPL).  A copy of this license was included in this distribution in a file called LICENSE.  If for some reason, this file was not included, please see F<http://www.gnu.org/licenses/> to obtain a copy of this license.
 
-$Id: Child.pm,v 1.31 2003/06/24 19:52:01 ekkis Exp $
+$Id: Child.pm,v 1.33 2004/06/03 04:16:35 ekkis Exp $
 
 =cut

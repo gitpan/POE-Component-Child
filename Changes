@@ -1,5 +1,16 @@
 Revision history for Perl extension POE-Component-Child.
 
+revision 1.33
+date: 2004/06/03 04:16:35;  author: ekkis;  state: Exp;  lines: +7 -6
+- this patch fixes a children reaping problem as described in rt.cpan.org
+  Ticket #6200.  Thanks to Justin DeVuyst for finding the bug and suggesting
+  the solution.
+- the patch may also fix Ticket #6193 reported by dngor
+
+revision 1.32
+date: 2003/06/25 23:54:25;  author: ekkis;  state: Exp;  lines: +3 -2
+- duh! fixed minor overlook pointed out by Mathieu
+
 revision 1.31
 date: 2003/06/24 19:52:01;  author: ekkis;  state: Exp;  lines: +24 -7
 - revamped kil() method to allow sending other signals to children processes.  T
