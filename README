@@ -20,7 +20,9 @@ Alternatively the module may be installed in RPM format like this:
 
 DEPENDENCIES
 
-This module is written in pure Perl and requires only the POE state engine.  It has been tested with version 0.23 but may work with older versions.
+This module is written in pure Perl and requires only the POE
+state engine.  It has been tested with version 0.23 but may work
+with older versions.
 
 AVAILABILITY
 
@@ -32,4 +34,9 @@ COPYRIGHT AND LICENCE
 
 Copyright (C) 2002 Erick Calder <ecalder@cpan.org>
 
-This product is distributed under the MIT License. A copy of this license was included in a file called LICENSE. If for some reason, this file was not included, please see http://www.opensource.org/licenses/mit-license.html to obtain a copy of this license.
+This product is distributed under the MIT License. A copy of this
+license was included in a file called LICENSE. If for some reason,
+this file was not included, please see the link below to obtain a
+copy of the license.
+
+http://www.opensource.org/licenses/mit-license.html

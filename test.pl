@@ -1,148 +1,145 @@
-#!/usr/bin/perl
+#!/usr/bin/perl -w
 
-# Before `make install' is performed this script should be runnable with
-# `make test'. After `make install' it should work as `perl test.pl'
+use Test::Simple tests => 13;
 
-#########################
+$, = " "; $\ = "\n";
+$t1 = $t2 = 1;				# tests to run
 
-use Test::Simple tests => 14;
+my $debug = $ENV{DEBUG} || 0;
+#sub POE::Kernel::TRACE_GARBAGE ()  { 1 }
+#sub POE::Kernel::ASSERT_DEFAULT () { 1 }
+
 use POE qw(Component::Child Filter::Stream);
 ok(1, 'use PoCo::Child'); # If we made it this far, we're ok.
 
-#########################
+my %t1 = (					# tests a non-interactive client
+	stdout	=> "t1_out",
+	stderr	=> "t1_err",
+	error	=> "t1_error",
+	done	=> "t1_done",
+	died	=> "t1_died",
+	);
 
-# Insert your test code below, the Test module is use()ed here so read
-# its man page ( perldoc Test ) for help writing this test script.
-
-$, = " ";
-$\ = "\n";
-
-my $debug = $ENV{DEBUG};
-
-# event handlers
-
-my %echo = (
-	stdout => "echo_out",
-	stderr => "echo_err",
-	error => "echo_error",
-	done => "echo_done",
-	died => "echo_died"
+my %t2 = (					# tests interactive client
+	stderr	=> "t2_err",
+	error	=> "t2_error",
+	died	=> "t2_died",
 	);
 
 # create main session
 
 $r = POE::Session->create(
-	package_states => ["main" => [ values(%echo) ]],
-	inline_states => {_start => sub { $_[KERNEL]->alias_set("main"); }}
+	package_states => ["main" => [ values(%t1), values(%t2) ]],
+	inline_states => {
+		_start => sub { $_[KERNEL]->alias_set("main"); },
+		_stop => sub { print "_stop" if $debug; },
+		_default => \&_default,
+		}
 	);
 
 ok(defined($r), "session created");
 
-# kick off first child process
+# test non-interactive child
 
-$p = POE::Component::Child->new(
-	callbacks => \%echo, debug => $debug
-	);
+if ($t1) {
+	$t1 = POE::Component::Child->new(
+		callbacks => \%t1, debug => $debug
+		);
+	ok(defined $t1 && $t1->isa('POE::Component::Child'), "component 1");
+	$t1->run("./echosrv --stdout");
+	}
 
-$n1 = $p->run("./echosrv --stdout");	# first test an non-interactive app
+# test interactive child
 
-ok(defined $p && $p->isa('POE::Component::Child') && $n1
-	, "read-only client started"
-	);
+if ($t2) {
+	$t2 = POE::Component::Child->new(
+		quit => "bye",
+		callbacks => { %t2, done => \&t2_done },
+		debug => $debug
+		);
+	ok(defined $t2 && $t2->isa('POE::Component::Child'), "component 2");
+	$t2->run("./echosrv");
+	$t2->write("hej");
+	}
 
 # POEtry in motion
 
 POE::Kernel->run();
 
-#
-#	event handlers
-#
+ok(1, "all tests successful");
 
-sub echo_out {
+# --- event handlers - non-interactive child ----------------------------------
+
+sub t1_out {
 	my ($self, $args) = @_[ARG0 .. $#_];
 	local $_ = $args->{out};
 
-	ok(/echo/, "got stdout");
+	ok(/echo/, "standard output");
 	}
 
-sub echo_err {
+sub t1_err {
 	my ($self, $args) = @_[ARG0 .. $#_];
-	local $_ = $args->{out};
+	ok($args->{out} =~ /echo/, "standard error");
+	}
 
-	if ($self->wheel() == $n2) {
-		ok(/hej/, "client write");
-		$self->quit();
+$t1n = 0;
+sub t1_done {
+	my ($self, $args) = @_[ARG0 .. $#_];
+
+	if ($t1n++ == 0) {
+		$t1->run("./echosrv", "--stderr");
+		}
+
+	else {
+		ok(1, "done");
+		$t1->run("./echosrv", "--die");
+		}
+	}
+
+sub t1_died {
+	ok(1, "died");
+	}
+
+sub t1_error {
+	my ($self, $args) = @_[ARG0 .. $#_];
+	ok(0, "Co1: unexpected error: $args->{error}");
+	}
+
+# --- event handlers - interactive child --------------------------------------
+
+sub t2_err {
+	my ($self, $args) = @_[ARG0 .. $#_];
+	ok($args->{out} eq "hej", "client write tested");
+	$t2->quit();
+	}
+
+$t2n = 0;
+sub t2_done {
+	my ($self, $args) = @_[ARG0 .. $#_];
+
+	if ($t2n++) {
+		ok(0, "kill problem");
 		return;
 		}
 
-	ok($args->{out} =~ /echo/, "got stderr");
+	ok(1, "callback references");
+	ok(1, "quit method");
+	$t2->run("./echosrv");
+	$t2->kill();
 	}
 
-sub echo_done {
-	my ($self, $args) = @_[ARG0 .. $#_];
-
-	my $wheel = $self->wheel();
-	if ($wheel == $n1) {
-		$p->run("./echosrv", "--stderr");
-		ok(1, "second instance");
-		return;
-		}
-
-	if ($wheel == $n2) {
-		ok(1, "quit tested");
-		$n3 = $self->run("./echosrv");
-		ok(1, "client restarted");
-		$self->kill();
-		return;
-		}
-
-	if ($wheel == $n3) {
-		return;
-		}
-
-	ok(1, "done");
-
-	# now test callbacks
-
-	$p = POE::Component::Child->new(
-		callbacks => { done => \&echo_done_call }, debug => $debug
-		);
-
-	$p->run("ls", "--die");
+sub t2_died {
+	my ($kernel, $self, $args) = @_[KERNEL, ARG0 .. $#_];
+	ok(1, "killed");
 	}
-
-sub echo_error {
-	my ($self, $args) = @_[ARG0 .. $#_];
-	ok(0, "got unexpected error: $args->{error}");
-	}
-
-sub echo_died {
-	my ($self, $args) = @_[ARG0 .. $#_];
-
-	if ($self->wheel() ==  $n3) {
-		ok(1, "killed");
-		ok(1, "all tests successful");
-		exit();
-		}
 	
-	ok(0, "client died! [$args->{err}]: $args->{error}");
+sub t2_error {
+	my ($self, $args) = @_[ARG0 .. $#_];
+	ok(0, "Co2: unexpected error: $args->{error}");
 	}
 
-sub echo_done_call {
-	ok(1, "hard callbacks");
-
-	# now test an interactive creature
-
-	$p = POE::Component::Child->new(
-		quit => "bye",
-		callbacks => \%echo,
-		debug => $debug,
-		);
-
-	ok($p && $p->isa("POE::Component::Child"),
-		"interactive client started"
-		);
-
-	$n2 = $p->run("./echosrv");
-	$p->write("hej");
+sub _default {
+	return unless $debug;
+	print qq/> _default: "$_[ARG0]" event, args: @{$_[ARG1]}/;
+	exit if $_[ARG1][0] eq "INT";
 	}

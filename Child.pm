@@ -17,16 +17,15 @@ use POE qw(Wheel::Run Filter::Line Driver::SysRW);
 # --- module variables --------------------------------------------------------
 
 use vars qw($VERSION);
-$VERSION = substr q$Revision: 1.7 $, 10;
+$VERSION = substr q$Revision: 1.16 $, 10;
 
 # --- module interface --------------------------------------------------------
 
 sub new {
 	my $class = shift;
-	my $opts = shift;
-
 	my $self = bless({}, $class);
 
+	my $opts = shift;
 	my %opts = !defined($opts) ? () : ref($opts) ? %$opts : ($opts, @_);
 	%$self = (%$self, %opts);
 
@@ -38,11 +37,12 @@ sub new {
 	$self->{callbacks}{died} ||= "died";
 
 	# session handler list
-	my @sh =	qw(_start stdout stderr done error sig_child);
+	my @sh =	qw(_start _stop);
+	push @sh,	qw(stdout stderr error sig_child);
 	push @sh,	qw(got_run got_write got_kill);
 
 	POE::Session->create(
-		package_states => [ POE::Component::Child => \@sh ],
+		package_states => [ "POE::Component::Child" => \@sh ],
 		heap => { self => $self }
 		);
 
@@ -87,27 +87,58 @@ sub wheel {
 
 sub _start {
 	my ($kernel, $heap, $session) = @_[KERNEL, HEAP, SESSION];
-	$heap->{self}{session} = $session->ID;
+	my $self = $heap->{self};
+	$self->{session} = $session->ID;
+	$self->debug("session-id: $self->{session}");
+
+	# install death handler
     $kernel->sig(CHLD => 'sig_child');
+
+	# to make sure our session sticks around between
+	# wheel invocations we set an alias (unique per sesion)
+
+	$kernel->alias_set("PoCo::Child::$self->{session}");
+	}
+
+sub _stop {
+	my ($heap, $session) = @_[HEAP, SESSION];
+	my $self = $heap->{self};
+
+	# felicitous infanticide
+	CORE::kill 9, $_ for keys %{ $self->{pids} };
+
+	# for enlightenment
+	$self->debug("_stop=" . $session->ID);
+	}
+
+#	not currently handled by the session.  not sure how
+#	to propagate
+
+sub _default {
+	my $heap = $_[HEAP];
+	my $self = $heap->{self};
+	$self->debug(qq/_default: "$_[ARG0]", args: @{$_[ARG1]}/);
 	}
 
 sub got_run {
-	my ($self, $cmd) = @_[ARG0, ARG1];
+	my ($kernel, $session, $self, $cmd) = @_[KERNEL, SESSION, ARG0, ARG1];
+
+	# init stuff
 
 	my $conduit = $self->{conduit};
-	$self->{StdioFilter} ||= POE::Filter::Line->new( Literal => "\n" );
+	$self->{StdioFilter} ||= POE::Filter::Line->new(OutputLiteral => "\n");
 
 	my $wheel = POE::Wheel::Run->new(
 		Program		=> $cmd,
 		StdioFilter	=> $self->{StdioFilter},
 		StdoutEvent	=> "stdout",
 		$conduit ? (Conduit => $conduit) : (StderrEvent => "stderr"),
-		CloseEvent	=> "done",
 		ErrorEvent	=> "error"
 		);
 
 	my $id = $wheel->ID;
-	$self->debug("got_run(): id=$id, pid=" . $wheel->PID);
+	$self->debug(qq/run(): "@$cmd", wheel=$id, pid=/ . $wheel->PID);
+
 	$self->{pids}{$wheel->PID} = $id;
 	$self->{wheels}{$id}{cmd} = $cmd;
 	$self->{wheels}{$id}{ref} = $wheel;
@@ -118,7 +149,7 @@ sub got_run {
 sub got_write {
 	my ($self, $wheel, $args) = @_[ARG0 .. ARG2];
 	$self->{wheels}{$wheel}{ref}->put(@$args);
-	$self->debug("got_write(): " . join(" ", @$args));
+	$self->debug(qq/got_write(): "/ . join(" ", @$args) . '"');
 	}
 
 sub got_kill {
@@ -149,13 +180,32 @@ sub stdio {
 
 *stdout = *stderr = *stdio;
 
-sub done {
-	my ($kernel, $heap, $event) = @_[KERNEL, HEAP, STATE];
+#   these signals are issued by the OS and thus are sent to all
+#   sessions.  any children this session owns will be stored in
+#   the {pids} hash
 
+sub sig_child {
+    my ($kernel, $heap, $pid, $rc) = @_[KERNEL, HEAP, ARG1, ARG2];
 	my $self = $heap->{self};
-	$self->callback($event, { wheel => $_[ARG0] });
+	my $sid = $_[SESSION]->ID;
+	my $id = $self->{pids}{$pid} || "";
 
-	$self->debug("$event()");
+	return unless $id;	# handle only our own children
+
+	# all expiring children should issue a "done" except when
+	# the return code is non-zero which indicates a failure
+	# if the caller asked we quit, fire a "done" regardless
+	# of the child's return code value (we might have hard killed)
+
+	my $event = ($self->{wheels}{$id}{quit} || $rc == 0) ? "done" : "died";
+	$self->callback($event, { wheel => $id, rc => $rc });
+
+	# clean up
+
+	delete $self->{wheels}{$id}{ref};
+	delete $self->{pids}{$id};
+
+	$self->debug("sig_child(): session=$sid, wheel=$id, pid=$pid, rc=$rc");
 	}
 
 sub error {
@@ -171,29 +221,16 @@ sub error {
 	return if $args->{syscall} eq "read" && $args->{err} == 0;
 
 	my $self = $heap->{self};
-	$self->{error} = $args->{err};
 	$self->callback($event, $args);
-
-	$self->debug("$event(): $args->{error}");
+	$self->debug("$event() [$args->{err}]: $args->{error}");
 	}
 
-sub sig_child {
-    my ($kernel, $heap, $pid, $rc) = @_[KERNEL, HEAP, ARG1, ARG2];
-	my $self = $heap->{self};
-	my $wheel = $self->{pids}{$pid} || return;
-
-	return if $self->{wheels}{$wheel}{quit};
-
-	my $args = { error => $self->{error}, rc => $rc };
-	$self->callback("died", $args);
-
-	$self->debug("sig_child(): pid=$pid, wheel=$wheel");
-	}
+# --- internal methods --------------------------------------------------------
 
 sub debug {
 	my $self = shift;
 	return unless $self->{debug};
-	local $\ = "\n"; print ">", join(" ", @_);
+	local $\ = "\n"; print "> PoCo::Child:", join(" ", @_);
 	}
 
 1; # yipiness
@@ -258,9 +295,9 @@ Setting this parameter to a true value generates debugging output (useful mostly
 
 This method requires an array indicating the command (and optional parameters) to run.  The command and its parameters may also be passed as a single string.  The method returns the I<id> of the wheel which is needed when running several commands simultasneously.
 
-Before calling this function, the caller may set stdio filter to a value of its choice, e.g.
+Before calling this function, the caller may set stdio filter to a value of his choice.  The example below shows the default used.
 
-I<$p-E<gt>{StdioFilter} = POE::Filter::Line-E<gt>new();>
+I<$p-E<gt>{StdioFilter} = POE::Filter::Line-E<gt>new(OutputLiteral => '\n');>
 
 =head2 write {array}
 
@@ -282,9 +319,9 @@ Used to set the current wheel for other methods to work with.  Please note that 
 
 =head1 EVENTS / CALLBACKS
 
-Events are are thrown at the session indicated as I<alias> and may be specified using the I<callbacks> argument to the I<new()> method.  If no such preference is indicated, the default event names listed below are used.  Whenever callbacks are specified, the are called instead of generating an event.
+Events are are thrown at the session indicated as I<alias> and may be specified using the I<callbacks> argument to the I<new()> method.  If no such preference is indicated, the default event names listed below are used.  Whenever callbacks are specified, they are called directly instead of generating an event.
 
-Event handlers are passed two arguments: ARG0 which is a reference to the component instance being used (I<$self>), and ARG1, a hash reference containing the wheel id being used (as I<wheel>) + values specific to the event.
+Event handlers are passed two arguments: ARG0 which is a reference to the component instance being used (i.e. I<$self>), and ARG1, a hash reference containing the wheel id being used (as I<wheel>) + values specific to the event.  Callbacks are passed the same arguments but as @_[0,1] instead.
 
 =head2 stdout
 
@@ -296,17 +333,17 @@ I<$_[ARG1]-E<gt>{out}>
 
 Works exactly as with I<stdout> but for the error channel.
 
-=head2 error
-
-This event is fired upon generation of any error by the child.  Arguments passed include: C<syscall>, C<err> (the numeric value of the error), C<error> (a textual description), and C<fh> (the file handle involved).
-
 =head2 done
 
-Fired when the child is finished.  Note: this event is *always* called upon termination, regardless of whether the child died naturally, abnormally or was requested to quit.
+Fired upon termination of the child, including such cases as when the child is asked to quit or when it ends naturally (as with non-interactive children).
 
 =head2 died
 
-Fired when abnormally ending.  Please note that this event is not generated when the user has called ->quit().
+Fired upon abnormal ending of a child.  This event is generated only for interactive children who terminate without having been asked to.  Inclusion of the C<died> key in the C<callbacks> hash passed to I<new()> qualifies a process for receiving this event and distinguishes it as interactive.  This event is mutually exclusive with C<done>.
+
+=head2 error
+
+This event is fired upon generation of any error by the child.  Arguments passed include: I<syscall>, I<err> (the numeric value of the error), I<error> (a textual description), and I<fh> (the file handle involved).
 
 =head1 AUTHOR
 
@@ -324,11 +361,11 @@ F<http://perl.arix.com>
 
 =head1 DATE
 
-$Date: 2002/09/19 02:33:23 $
+$Date: 2002/09/30 01:07:44 $
 
 =head1 VERSION
 
-$Revision: 1.7 $
+$Revision: 1.16 $
 
 =head1 LICENSE AND COPYRIGHT
 
