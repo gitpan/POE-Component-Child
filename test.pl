@@ -1,9 +1,14 @@
 #!/usr/bin/perl -w
 
-use Test::Simple tests => 13;
+use Cwd;
 
 $, = " "; $\ = "\n";
-$t1 = $t2 = 1;				# tests to run
+my $t1 = 5;			# number of
+my $t2 = 5;			# tests per
+my $t3 = 2;         # section
+# $t2 = 0;			# turns sections off
+
+eval qq/use Test::Simple tests => 4 + $t1 + $t2 + $t3/;
 
 my $debug = $ENV{DEBUG} || 0;
 #sub POE::Kernel::TRACE_GARBAGE ()  { 1 }
@@ -26,10 +31,16 @@ my %t2 = (					# tests interactive client
 	died	=> "t2_died",
 	);
 
+my %t3 = (
+    stdout  => "t3_out",
+    );
+
 # create main session
 
 $r = POE::Session->create(
-	package_states => ["main" => [ values(%t1), values(%t2) ]],
+	package_states => [
+        main => [ values(%t1), values(%t2), values(%t3) ]
+        ],
 	inline_states => {
 		_start => sub { $_[KERNEL]->alias_set("main"); },
 		_stop => sub { print "_stop" if $debug; },
@@ -43,7 +54,7 @@ ok(defined($r), "session created");
 
 if ($t1) {
 	$t1 = POE::Component::Child->new(
-		callbacks => \%t1, debug => $debug
+		events => \%t1, debug => $debug
 		);
 	ok(defined $t1 && $t1->isa('POE::Component::Child'), "component 1");
 	$t1->run("./echosrv --stdout");
@@ -53,8 +64,8 @@ if ($t1) {
 
 if ($t2) {
 	$t2 = POE::Component::Child->new(
-		quit => "bye",
-		callbacks => { %t2, done => \&t2_done },
+		writemap => { quit => "bye" },
+		events => { %t2, done => \&t2_done },
 		debug => $debug
 		);
 	ok(defined $t2 && $t2->isa('POE::Component::Child'), "component 2");
@@ -62,10 +73,21 @@ if ($t2) {
 	$t2->write("hej");
 	}
 
+# test other stuff
+
+if ($t3) {
+	$t3 = POE::Component::Child->new(
+		events => \%t3, debug => $debug, chdir => "/tmp",
+		);
+	ok(defined $t3 && $t3->isa('POE::Component::Child'), "component 3");
+	$t3->run("pwd");
+    }
+
 # POEtry in motion
 
 POE::Kernel->run();
 
+ok(cwd() ne "/tmp", "dir change restored");
 ok(1, "all tests successful");
 
 # --- event handlers - non-interactive child ----------------------------------
@@ -91,13 +113,13 @@ sub t1_done {
 		}
 
 	else {
-		ok(1, "done");
+		ok(1, "done event");
 		$t1->run("./echosrv", "--die");
 		}
 	}
 
 sub t1_died {
-	ok(1, "died");
+	ok(1, "died tested");
 	}
 
 sub t1_error {
@@ -137,6 +159,11 @@ sub t2_error {
 	my ($self, $args) = @_[ARG0 .. $#_];
 	ok(0, "Co2: unexpected error: $args->{error}");
 	}
+
+sub t3_out {
+	my ($self, $args) = @_[ARG0 .. $#_];
+	ok($args->{out} eq "/tmp", "dir change");
+    }
 
 sub _default {
 	return unless $debug;

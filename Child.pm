@@ -1,7 +1,20 @@
 #
-#	POE child management
-#	Copyright (c) Erick Calder, 2002.
-#	All rights reserved.
+#   POE::Component::Child - Child manager
+#   Copyright (C) 2001-2003 Erick Calder
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; either version 2 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program; if not, write to the Free Software
+#   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #
 
 package POE::Component::Child;
@@ -11,38 +24,39 @@ package POE::Component::Child;
 use warnings;
 use strict;
 use Carp;
+use Cwd;
 
-use POE qw(Wheel::Run Filter::Line Driver::SysRW);
+use POE 0.23 qw(Wheel::Run Filter::Line Driver::SysRW);
 
 # --- module variables --------------------------------------------------------
 
-use vars qw($VERSION);
-$VERSION = substr q$Revision: 1.16 $, 10;
+use vars qw($VERSION $PKG $AUTOLOAD);
+$VERSION = substr q$Revision: 1.31 $, 10;
+$PKG = __PACKAGE__;
 
 # --- module interface --------------------------------------------------------
 
 sub new {
-	my $class = shift;
+	my $proto = shift;
+	my $class = ref($proto) || $proto;
 	my $self = bless({}, $class);
 
-	my $opts = shift;
-	my %opts = !defined($opts) ? () : ref($opts) ? %$opts : ($opts, @_);
-	%$self = (%$self, %opts);
+	my %args = @_;
+	$args{alias} ||= "main";
+	$args{debug} ||= 0;
+	$args{events}{$_} ||= $_
+		for qw/stdout stderr error done died/;
+	$self->{$PKG} = \%args;
 
-	$self->{alias} ||= "main";
-	$self->{callbacks}{stdout} ||= "stdout";
-	$self->{callbacks}{stderr} ||= "stderr";
-	$self->{callbacks}{error} ||= "error";
-	$self->{callbacks}{done} ||= "done";
-	$self->{callbacks}{died} ||= "died";
-
-	# session handler list
-	my @sh =	qw(_start _stop);
-	push @sh,	qw(stdout stderr error sig_child);
-	push @sh,	qw(got_run got_write got_kill);
+	# events we catch from the session
+	my @sh = qw/
+        _start _stop
+        stdout stderr error close
+        sig_child got_run
+        /;
 
 	POE::Session->create(
-		package_states => [ "POE::Component::Child" => \@sh ],
+		package_states => [ $PKG => \@sh ],
 		heap => { self => $self }
 		);
 
@@ -51,36 +65,54 @@ sub new {
 
 sub run {
 	my $self = shift;
-	POE::Kernel->call($self->{session}, got_run => $self, \@_);
+	POE::Kernel->call($self->{$PKG}{session}, got_run => $self, \@_);
 	}
 
 sub write {
 	my $self = shift;
-	POE::Kernel->post($self->{session},
-		got_write => $self, $self->wheel(), \@_
-		);
+	my $wheel = $self->wheel();
+	$self->debug(qq/write(): "/ . join(" ", @_) . qq/"/);
+	$wheel->put(@_);
 	}
 
 sub quit {
 	my $self = shift;
-	my $quit = shift || $self->{quit};
+	my $quit = shift || $self->{$PKG}{writemap}{quit};
+	my $id = $self->wheel();
 
 	$quit ? $self->write($quit) : $self->kill();
-
-	$self->{wheels}{$self->wheel()}{quit} = 1;
+	$self->{$PKG}{wheels}{$id}{quit} = 1;
 	}
 
 sub kill {
 	my $self = shift;
-	POE::Kernel->post($self->{session},
-		got_kill => $self, $self->wheel()
-		);
+    my $sig = $_{HARD} ? 9 : $_{SIG} || 'TERM';
+    my $nod = $_{NODIE} || 0;
+
+	my $id = $self->wheelid();
+	$self->{$PKG}{wheels}{$id}{quit} = $nod;
+
+	my $pid = $self->wheel()->PID;
+	CORE::kill $sig, $pid;
+	$self->debug("kill(): $pid");
 	}
 
-sub wheel {
+sub shutdown {
 	my $self = shift;
-	$self->{wheels}{current} = shift if @_;
-	$self->{wheels}{current};
+	POE::Kernel->alias_remove("${PKG}::$self->{$PKG}{session}");
+	}
+
+sub attr {
+	my ($self, $key, $val) = @_;
+
+	my @keys = split m|/|, $key;
+	$key = pop @keys;
+
+	my $ref = \$self->{$PKG};
+	$ref = \$ref->{$_} for @keys;
+
+	$ref->{$key} = $val if $val;
+	return $ref->{$key};
 	}
 
 # --- session handlers --------------------------------------------------------
@@ -88,8 +120,8 @@ sub wheel {
 sub _start {
 	my ($kernel, $heap, $session) = @_[KERNEL, HEAP, SESSION];
 	my $self = $heap->{self};
-	$self->{session} = $session->ID;
-	$self->debug("session-id: $self->{session}");
+	$self->{$PKG}{session} = $session->ID;
+	$self->debug("session-id: $self->{$PKG}{session}");
 
 	# install death handler
     $kernel->sig(CHLD => 'sig_child');
@@ -97,17 +129,26 @@ sub _start {
 	# to make sure our session sticks around between
 	# wheel invocations we set an alias (unique per sesion)
 
-	$kernel->alias_set("PoCo::Child::$self->{session}");
+	$kernel->alias_set("${PKG}::$self->{$PKG}{session}");
 	}
 
 sub _stop {
 	my ($heap, $session) = @_[HEAP, SESSION];
 	my $self = $heap->{self};
 
-	# felicitous infanticide
-	CORE::kill 9, $_ for keys %{ $self->{pids} };
+	#	clean remaining wheels
+
+	delete $self->{$PKG}{wheels}{current};
+	for my $id (keys %{ $self->{$PKG}{wheels} }) {
+		delete $self->{$PKG}{wheels}{$id};
+		}
+
+	#	and wipe children
+
+	CORE::kill 9, $_ for keys %{ $self->{$PKG}{pids} };
 
 	# for enlightenment
+
 	$self->debug("_stop=" . $session->ID);
 	}
 
@@ -125,46 +166,41 @@ sub got_run {
 
 	# init stuff
 
-	my $conduit = $self->{conduit};
-	$self->{StdioFilter} ||= POE::Filter::Line->new(OutputLiteral => "\n");
+	my $conduit = $self->{$PKG}{conduit};
+	$self->{$PKG}{StdioFilter}
+		||= POE::Filter::Line->new(OutputLiteral => "\n");
+
+    my $cwd = cwd();
+    chdir $self->{$PKG}{chdir} if $self->{$PKG}{chdir};
 
 	my $wheel = POE::Wheel::Run->new(
 		Program		=> $cmd,
-		StdioFilter	=> $self->{StdioFilter},
+		StdioFilter	=> $self->{$PKG}{StdioFilter},
 		StdoutEvent	=> "stdout",
 		$conduit ? (Conduit => $conduit) : (StderrEvent => "stderr"),
-		ErrorEvent	=> "error"
+		ErrorEvent	=> "error",
+        CloseEvent  => "close",
 		);
+
+    chdir $cwd if $self->{$PKG}{chdir};
 
 	my $id = $wheel->ID;
 	$self->debug(qq/run(): "@$cmd", wheel=$id, pid=/ . $wheel->PID);
 
-	$self->{pids}{$wheel->PID} = $id;
-	$self->{wheels}{$id}{cmd} = $cmd;
-	$self->{wheels}{$id}{ref} = $wheel;
-	$self->{wheels}{$id}{quit} = 0;
-	$self->wheel($id);
-	}
-
-sub got_write {
-	my ($self, $wheel, $args) = @_[ARG0 .. ARG2];
-	$self->{wheels}{$wheel}{ref}->put(@$args);
-	$self->debug(qq/got_write(): "/ . join(" ", @$args) . '"');
-	}
-
-sub got_kill {
-	my ($self, $wheel) = @_[ARG0, ARG1];
-	my $pid = $self->{wheels}{$wheel}{ref}->PID;
-	CORE::kill 9, $pid;
-	$self->debug("got_kill(): $pid");
+	$self->{$PKG}{pids}{$wheel->PID} = $id;
+	$self->{$PKG}{wheels}{$id}{cmd} = $cmd;
+	$self->{$PKG}{wheels}{$id}{ref} = $wheel;
+	$self->{$PKG}{wheels}{$id}{quit} = 0;
+	$self->wheelid($id);
 	}
 
 sub callback {
 	my ($self, $event, $args) = @_;
-	my $call = $self->{callbacks}{$event};
+	my $call = $self->{$PKG}{events}{$event};
+	$self->debug("callback(): $event=$call", 2);
 	ref($call) eq "CODE"
 		? $call->($self, $args)
-		: POE::Kernel->post($self->{alias}, $call, $self, $args)
+		: POE::Kernel->post($self->{$PKG}{alias}, $call, $self, $args)
 		;
 	}
 
@@ -175,37 +211,61 @@ sub stdio {
 	my $self = $heap->{self};
 	$self->callback($event, { out => $_[ARG0], wheel => $_[ARG1] });
 
-	$self->debug(qq/$event(): "$_[ARG0]"/);
+	$self->debug(qq/$event(): "$_[ARG0]"/, 2);
 	}
 
 *stdout = *stderr = *stdio;
 
-#   these signals are issued by the OS and thus are sent to all
-#   sessions.  any children this session owns will be stored in
-#   the {pids} hash
-
 sub sig_child {
     my ($kernel, $heap, $pid, $rc) = @_[KERNEL, HEAP, ARG1, ARG2];
-	my $self = $heap->{self};
-	my $sid = $_[SESSION]->ID;
-	my $id = $self->{pids}{$pid} || "";
+    my $self = $heap->{self};
 
-	return unless $id;	# handle only our own children
+	my $id = $self->{$PKG}{pids}{$pid} || "";
+
+    # child death signals are issued by the OS and sent to all
+    # sessions; we want to handle only our own children
+
+	return unless $id;
+
+    $kernel->sig_handled() if $POE::VERSION >= 0.20;
+
+    my %args = (self => $self, id => $id, rc => $rc);
+    return done(%args) if $self->{$PKG}{CloseEvent};
+    $self->{$PKG}{SIGCHLD} = \%args;
+
+    my $sid = $_[SESSION]->ID;
+	$self->debug("sig_child(): session=$sid, wheel=$id, pid=$pid, rc=$rc");
+    }
+
+#   the child has closed its output pipes
+
+sub close {
+    my $self = $_[HEAP]->{self};
+    my $sigchld = $self->{$PKG}{SIGCHLD};
+
+    return done(%$sigchld) if $sigchld;
+
+    $self->{$PKG}{CloseEvent} = 1;
+    $self->debug("close()");
+    }
+
+sub done {
+    %_ = @_; my ($self, $id, $rc) = @_{qw/self id rc/};
+
+	# clean up
+
+	delete $self->{$PKG}{wheels}{$id};
+	delete $self->{$PKG}{pids}{$id};
 
 	# all expiring children should issue a "done" except when
 	# the return code is non-zero which indicates a failure
 	# if the caller asked we quit, fire a "done" regardless
 	# of the child's return code value (we might have hard killed)
 
-	my $event = ($self->{wheels}{$id}{quit} || $rc == 0) ? "done" : "died";
+	my $event = ($self->{$PKG}{wheels}{$id}{quit} || $rc == 0)
+		? "done" : "died"
+		;
 	$self->callback($event, { wheel => $id, rc => $rc });
-
-	# clean up
-
-	delete $self->{wheels}{$id}{ref};
-	delete $self->{pids}{$id};
-
-	$self->debug("sig_child(): session=$sid, wheel=$id, pid=$pid, rc=$rc");
 	}
 
 sub error {
@@ -227,10 +287,41 @@ sub error {
 
 # --- internal methods --------------------------------------------------------
 
+sub wheelid {
+	my $self = shift;
+	$self->{$PKG}{wheels}{current} = shift if @_;
+	$self->{$PKG}{wheels}{current};
+	}
+
+sub wheel {
+	my $self = shift;
+	my $id = shift || $self->{$PKG}{wheels}{current};
+	$self->{$PKG}{wheels}{$id}{ref};
+	}
+
 sub debug {
 	my $self = shift;
-	return unless $self->{debug};
-	local $\ = "\n"; print "> PoCo::Child:", join(" ", @_);
+	my $arg = shift || $_;
+	my $debug = shift || 1;
+	my $hdr = shift || $PKG;
+
+	return unless $self->{$PKG}{debug} >= $debug;
+
+	local ($\, $,) = ("\n", " ");
+	print STDERR ">", $hdr, "-", $arg;
+	}
+
+sub AUTOLOAD {
+	my $self = shift;
+	my $attr = $AUTOLOAD;
+	$attr =~ s/.*:://;
+	return if $attr eq 'DESTROY';   
+
+	my $cmd = $self->{$PKG}{writemap}{$attr};
+	$self->write($cmd), return if $cmd;
+
+	my $super = "SUPER::$attr";
+	$self->$super(@_);
 	}
 
 1; # yipiness
@@ -243,12 +334,12 @@ POE::Component::Child - Child management component
 
 =head1 SYNOPSIS
 
-	use POE qw(Component::Child);
+ use POE qw(Component::Child);
 
-	$p = POE::Component::Child->new();
-	$p->run("ls", "-alF", "/tmp");
+ $p = POE::Component::Child->new();
+ $p->run("ls", "-alF", "/tmp");
 
-	POE::Kernel->run();
+ POE::Kernel->run();
 
 =head1 DESCRIPTION
 
@@ -258,7 +349,7 @@ This POE component serves as a wrapper for POE::Wheel::Run, obviating the need t
 
 The module provides an object-oriented interface as follows: 
 
-=head2 new [hash-ref]
+=head2 new [hash[-ref]]
 
 Used to initialise the system and create a component instance.  The function may be passed either a hash or a reference to a hash.  The keys below are meaningful to the component, all others are passed to the provided callbacks.
 
@@ -266,22 +357,32 @@ Used to initialise the system and create a component instance.  The function may
 
 Indicates the name of a session to which module callbacks will be posted.  Default: C<main>.
 
-=item callbacks
+=item events
 
 This hash reference contains mappings for the events the component will generate.  Callers can set these values to either event handler names (strings) or to callbacks (code references).  If names are given, the events are thrown at the I<alias> specified; when a code reference is given, it is called directly.  Allowable keys are listed below under section "Event Callbacks".
 
+=over
+
 - I<exempli gratia> -
+
+=back
 
 	$p = POE::Component::Child->new(
 		alias => "my_session",
-		callbacks => { stdout => "my_out", stderr => \&my_err }
+		events => { stdout => "my_out", stderr => \&my_err }
 		);
 
 In the above example, any output produced by children on I<stdout> generates an event I<my_out> for the I<my_session> session, whilst output on I<stderr> causes a call to I<my_err()>.
 
-=item quit
+=item writemap
 
-Indicates a string which should be sent to the child when attempting to quit.  This is only useful for interactive clients e.g. ftp, for whom either "bye" or "quit" will work.
+This item may be set to a hash reference containing a mapping of method names to strings that will be written to the client.
+
+- I<exempli gratia> -
+
+	writemap => { quit => "bye", louder => "++" }
+
+In the above example a caller can issue a call to I<$self->quit()>, in which case the string C<bye> will be written to the client, or I<$self->louder()> to have the client receive the string C<++>.
 
 =item conduit
 
@@ -297,7 +398,7 @@ This method requires an array indicating the command (and optional parameters) t
 
 Before calling this function, the caller may set stdio filter to a value of his choice.  The example below shows the default used.
 
-I<$p-E<gt>{StdioFilter} = POE::Filter::Line-E<gt>new(OutputLiteral => '\n');>
+I<$p-E<gt>{StdioFilter} = POE::Filter::Line-E<gt>new(OutputLiteral =E<gt> '\n');>
 
 =head2 write {array}
 
@@ -305,17 +406,46 @@ This method is used to send input to the child.  It can accept an array and will
 
 =head2 quit [command]
 
-This method requests that the client quit.  An optional I<command> string may be passed which is sent to the child - this is useful for graceful shutdown of interactive children e.g. the ftp command understands "bye" to quit.
+This method requests that the currently selected wheel quit.  An optional I<command> string may be passed which is sent to the child - this is useful for graceful shutdown of interactive children e.g. the ftp command understands "bye" to quit.
 
-If no I<command> is specified, the system will use whatever string was passed as the I<quit> argument to I<new()>.  If this too was left unspecified, a kill is issued.  Please note if the child is instructed to quit, it will not generate a I<died> event, but a I<done> instead (even when hard killed).
+If no I<command> is specified, the system will use whatever string was passed as the I<quit> item in the I<writemap> hash argument to I<new()>.  If this too was left unspecified, a kill is issued.  Please note if the child is instructed to quit, it will not generate a I<died> event, but a I<done> instead (even when hard killed).
 
-=head2 kill
+Please note that quitting all children will not shut the component down - for that use the I<shutdown> method.
 
-Instructs the component to hard kill (-9) the child.  Note that the event generated is I<died> and not I<done>.
+=head2 kill [HARD/SIG = TERM, NODIE = 0]
 
-=head2 wheel
+Instructs the component to send the child a signal.  By default the I<TERM> signal is sent but the I<SIG> named parameter allows the caller to specify anything else.  If I<HARD> => 1 is specified, a hard kill (-9) is done and any specific signal passed is ignored.
 
-Used to set the current wheel for other methods to work with.  Please note that ->write(), ->quit() and ->kill() will work on the wheel most recently created.  I you wish to work with a previously created wheel, set it with this method.
+Note that by default killing the child will generate a I<died> event (not a I<done>) unless the named parameter I<NODIE> is passed a true value.
+
+Additionally, note that kills are done immediately, not scheduled.
+
+=over
+
+- I<exempli gratia> -
+
+=back
+
+	$obj->kill();                       # a TERM signal is sent
+    $obj->kill(HARD => 1);              # a -9 gets sent
+    $obj->kill(SIG => 'INT');           # obvious
+    $obj->kill(HARD => 1, NODIE => 1);  # hard kill w/o a C<died> event
+
+=head2 shutdown
+
+This method causes the component to kill all children and shut down.
+
+=head2 attr <key> [val]
+
+Gets or sets the value of a certain key.  Values inside of hashes may be specified by separating the keys with slashes e.g. $self->attr("events/quit", "bye"); whould store C<bye> in {events}{quit} inside of the object.
+
+=head2 wheelid
+
+Used to set the current wheel for other methods to work with.  Please note that I<-E<gt>write()>, I<-E<gt>quit()> and I<-E<gt>kill()> will work on the wheel most recently created.  I you wish to work with a previously created wheel, set it with this method.
+
+=head2 wheel [id]
+
+Returns a reference to the current wheel.  If an id is provided then that wheel is returned.
 
 =head1 EVENTS / CALLBACKS
 
@@ -325,7 +455,7 @@ Event handlers are passed two arguments: ARG0 which is a reference to the compon
 
 =head2 stdout
 
-This event is fired upon any generation of output from the client.  The output produces is provided in C<out>, e.g.:
+This event is fired upon any generation of output from the client.  The output produced is provided in C<out>, e.g.:
 
 I<$_[ARG1]-E<gt>{out}>
 
@@ -335,11 +465,11 @@ Works exactly as with I<stdout> but for the error channel.
 
 =head2 done
 
-Fired upon termination of the child, including such cases as when the child is asked to quit or when it ends naturally (as with non-interactive children).
+Fired upon termination of the child, including such cases as when the child is asked to quit or when it ends naturally (as with non-interactive children).  Please note that the event is fired when _both_ the OS death signal has been received _and_ the child has closed its output pipes (this also holds true for the I<died> event described below).
 
 =head2 died
 
-Fired upon abnormal ending of a child.  This event is generated only for interactive children who terminate without having been asked to.  Inclusion of the C<died> key in the C<callbacks> hash passed to I<new()> qualifies a process for receiving this event and distinguishes it as interactive.  This event is mutually exclusive with C<done>.
+Fired upon abnormal ending of a child.  This event is generated only for interactive children who terminate without having been asked to.  Inclusion of the C<died> key in the C<callbacks> hash passed to I<-E<gt>new()> qualifies a process for receiving this event and distinguishes it as interactive.  This event is mutually exclusive with C<done>.
 
 =head2 error
 
@@ -359,14 +489,16 @@ This module may be found on the CPAN.  Additionally, both the module and its RPM
 
 F<http://perl.arix.com>
 
-=head1 DATE
+=head1 SUPPORT
 
-$Date: 2002/09/30 01:07:44 $
-
-=head1 VERSION
-
-$Revision: 1.16 $
+Thank you notes, expressions of aggravation and suggestions may be mailed directly to the author :)
 
 =head1 LICENSE AND COPYRIGHT
 
-Copyright (c) 2002 Erick Calder. This product is distributed under the MIT License. A copy of this license was included in a file called LICENSE. If for some reason, this file was not included, please see F<http://www.opensource.org/licenses/mit-license.html> to obtain a copy of this license.
+Copyright (c) 2002-2003 Erick Calder.
+
+This product is free and distributed under the Gnu Public License (GPL).  A copy of this license was included in this distribution in a file called LICENSE.  If for some reason, this file was not included, please see F<http://www.gnu.org/licenses/> to obtain a copy of this license.
+
+$Id: Child.pm,v 1.31 2003/06/24 19:52:01 ekkis Exp $
+
+=cut
