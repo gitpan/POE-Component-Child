@@ -1,6 +1,6 @@
 #
 #   POE::Component::Child - Child manager
-#   Copyright (C) 2001-2003 Erick Calder
+#   Copyright (C) 2001-2005 Erick Calder
 #
 #   This program is free software; you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -26,12 +26,12 @@ use strict;
 use Carp;
 use Cwd;
 
-use POE 0.23 qw(Wheel::Run Filter::Line Driver::SysRW);
+use POE 0.29 qw(Wheel::Run Filter::Line Driver::SysRW);
 
 # --- module variables --------------------------------------------------------
 
 use vars qw($VERSION $PKG $AUTOLOAD);
-$VERSION = substr q$Revision: 1.33 $, 10;
+$VERSION = substr q$Revision: 1.39 $, 10;
 $PKG = __PACKAGE__;
 
 # --- module interface --------------------------------------------------------
@@ -51,13 +51,12 @@ sub new {
 	# events we catch from the session
 	my @sh = qw/
         _start _stop
-        stdout stderr error close
+        stdin stdout stderr error close
         sig_child got_run
         /;
 
 	POE::Session->create(
-		package_states => [ $PKG => \@sh ],
-		heap => { self => $self }
+		object_states => [ $self => \@sh ]
 		);
 
 	return $self;
@@ -65,23 +64,31 @@ sub new {
 
 sub run {
 	my $self = shift;
-	POE::Kernel->call($self->{$PKG}{session}, got_run => $self, \@_);
+	POE::Kernel->call($self->{$PKG}{session}, got_run => \@_);
 	}
 
 sub write {
 	my $self = shift;
 	my $wheel = $self->wheel();
-	$self->debug(qq/write(): "/ . join(" ", @_) . qq/"/);
-	$wheel->put(@_);
+    if (defined $wheel) {
+	    $self->debug(qq/write(): "/ . join(" ", @_) . qq/"/);
+	    $wheel->put(@_);
+        }
+    else {
+        $self->debug(sprintf(
+            q/wheel undefined, refusing to write(): "%s"/, join(" ", @_)
+            ));
+        }
 	}
 
 sub quit {
 	my $self = shift;
 	my $quit = shift || $self->{$PKG}{writemap}{quit};
-	my $id = $self->wheel();
+	my $id = $self->wheelid();
 
-	$quit ? $self->write($quit) : $self->kill();
 	$self->{$PKG}{wheels}{$id}{quit} = 1;
+	$self->write($quit) if $quit;
+    $self->stdin_close();
 	}
 
 sub kill {
@@ -119,8 +126,7 @@ sub attr {
 # --- session handlers --------------------------------------------------------
 
 sub _start {
-	my ($kernel, $heap, $session) = @_[KERNEL, HEAP, SESSION];
-	my $self = $heap->{self};
+	my ($kernel, $session, $self) = @_[KERNEL, SESSION, OBJECT];
 	$self->{$PKG}{session} = $session->ID;
 	$self->debug("session-id: $self->{$PKG}{session}");
 
@@ -134,8 +140,7 @@ sub _start {
 	}
 
 sub _stop {
-	my ($heap, $session) = @_[HEAP, SESSION];
-	my $self = $heap->{self};
+	my ($self, $session) = @_[OBJECT, SESSION];
 
 	#	clean remaining wheels
 
@@ -157,13 +162,12 @@ sub _stop {
 #	to propagate
 
 sub _default {
-	my $heap = $_[HEAP];
-	my $self = $heap->{self};
+	my $self = $_[OBJECT];
 	$self->debug(qq/_default: "$_[ARG0]", args: @{$_[ARG1]}/);
 	}
 
 sub got_run {
-	my ($kernel, $session, $self, $cmd) = @_[KERNEL, SESSION, ARG0, ARG1];
+	my ($kernel, $session, $self, $cmd) = @_[KERNEL, SESSION, OBJECT, ARG0];
 
 	# init stuff
 
@@ -192,6 +196,7 @@ sub got_run {
 	$self->{$PKG}{wheels}{$id}{cmd} = $cmd;
 	$self->{$PKG}{wheels}{$id}{ref} = $wheel;
 	$self->{$PKG}{wheels}{$id}{quit} = 0;
+	$self->{$PKG}{wheels}{$id}{stdin_close} = 0;
 	$self->wheelid($id);
 	}
 
@@ -206,20 +211,24 @@ sub callback {
 	}
 
 sub stdio {
-	my ($kernel, $heap, $event) = @_[KERNEL, HEAP, STATE];
+	my ($kernel, $self, $event) = @_[KERNEL, OBJECT, STATE];
 	return unless $_[ARG0];
 
-	my $self = $heap->{self};
 	$self->callback($event, { out => $_[ARG0], wheel => $_[ARG1] });
-
 	$self->debug(qq/$event(): "$_[ARG0]"/, 2);
 	}
+
+sub stdin {
+    my ($kernel, $self, $event) = @_[KERNEL, OBJECT, STATE];
+    my $id = $_[ARG0] || return;
+    $self->debug("stdin: $id flushed", 2);
+    $self->pending_close();
+    }
 
 *stdout = *stderr = *stdio;
 
 sub sig_child {
-    my ($kernel, $heap, $pid, $rc) = @_[KERNEL, HEAP, ARG1, ARG2];
-    my $self = $heap->{self};
+    my ($kernel, $self, $pid, $rc) = @_[KERNEL, OBJECT, ARG1, ARG2];
 
 	my $id = $self->{$PKG}{pids}{$pid} || "";
 
@@ -231,18 +240,18 @@ sub sig_child {
     $kernel->sig_handled() if $POE::VERSION >= 0.20;
 
     my %args = (self => $self, id => $id, rc => $rc);
-    return done(%args) if $self->{$PKG}{CLOSED}{$id};
+    return done(%args), 0 if $self->{$PKG}{CLOSED}{$id};
     $self->{$PKG}{SIGCHLD}{$id} = \%args;
 
     my $sid = $_[SESSION]->ID;
 	$self->debug("sig_child(): session=$sid, wheel=$id, pid=$pid, rc=$rc");
+    return 0;
     }
 
 #   the child has closed its output pipes
 
 sub close {
-    my $self = $_[HEAP]->{self};
-    my $id = $_[ARG0];
+    my ($self, $id) = @_[OBJECT, ARG0];
     my $sigchld = $self->{$PKG}{SIGCHLD}{$id};
 
     return done(%$sigchld) if $sigchld;
@@ -271,7 +280,7 @@ sub done {
 	}
 
 sub error {
-	my ($kernel, $heap, $event) = @_[KERNEL, HEAP, STATE];
+	my ($kernel, $self, $event) = @_[KERNEL, OBJECT, STATE];
 	my $args = {
 		syscall	=> $_[ARG0],
 		err		=> $_[ARG1],
@@ -282,7 +291,6 @@ sub error {
 
 	return if $args->{syscall} eq "read" && $args->{err} == 0;
 
-	my $self = $heap->{self};
 	$self->callback($event, $args);
 	$self->debug("$event() [$args->{err}]: $args->{error}");
 	}
@@ -300,6 +308,28 @@ sub wheel {
 	my $id = shift || $self->{$PKG}{wheels}{current};
 	$self->{$PKG}{wheels}{$id}{ref};
 	}
+
+sub stdin_close {
+    my ($self, $id) = @_;
+    $id = $self->wheelid() unless defined $id;
+    $self->debug("stdin_close: $id");
+    $self->{$PKG}{wheels}{$id}{stdin_close} = 1;
+    $self->pending_close();
+    }
+
+sub pending_close {
+    my $self = shift;
+   
+    for my $id (keys %{$self->{$PKG}{wheels}}) {
+        my $wheel = $self->{$PKG}{wheels}{$id};
+        next unless ref $wheel && ref $wheel->{ref};
+        next if $wheel->{ref}->get_driver_out_octets();
+        next unless $wheel->{stdin_close};
+
+        $self->debug("pending_close: $id should be closed");
+        $wheel->{ref}->shutdown_stdin();
+        }
+    }
 
 sub debug {
 	my $self = shift;
@@ -501,6 +531,6 @@ Copyright (c) 2002-2003 Erick Calder.
 
 This product is free and distributed under the Gnu Public License (GPL).  A copy of this license was included in this distribution in a file called LICENSE.  If for some reason, this file was not included, please see F<http://www.gnu.org/licenses/> to obtain a copy of this license.
 
-$Id: Child.pm,v 1.33 2004/06/03 04:16:35 ekkis Exp $
+$Id: Child.pm,v 1.39 2005/12/30 04:14:38 ekkis Exp $
 
 =cut

@@ -1,5 +1,24 @@
 Revision history for Perl extension POE-Component-Child.
 
+revision 1.38
+- patches as per Curtis Hawthorne <curtis@curtis.hawthorne.name>
+
+revision 1.37
+- small patches
+
+revision 1.36
+- CPAN ticket # 13560 - thanks to MRPERSON@cpan.org for providing the analysis
+  and patch.
+
+revision 1.35
+- adds code to close stdin when shutting down.  this code was contributed so long ago
+  I've lost track of who made the submission.
+- also checks for situations where wheels are undefined
+
+revision 1.34
+date: 2004/06/07 03:13:49;  author: ekkis;  state: Exp;  lines: +4 -3
+- modified sig_child() to return 0 which avoids nasty POE warnings
+
 revision 1.33
 date: 2004/06/03 04:16:35;  author: ekkis;  state: Exp;  lines: +7 -6
 - this patch fixes a children reaping problem as described in rt.cpan.org
